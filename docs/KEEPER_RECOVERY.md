@@ -368,6 +368,34 @@ const checkpoint = await listener.persist();
 `persistOnPoll: false` disables the automatic write when the caller manages
 persistence itself.
 
+## Filtering by topic prefix
+
+`ContractEventListener` supports filtering contract events by leading topic
+segments via `topicPrefixes`:
+
+```ts
+const listener = new ContractEventListener(server, {
+  contractAddresses: [VAULT_A],
+  topicPrefixes: [['deposit', 'pool_1'], ['harvest']],
+  startLedger: 0,
+  store: new FileCheckpointStore('./state/keeper.json'),
+});
+```
+
+- **Matching semantics**: Each entry in `topicPrefixes` is a non-empty array of
+  exact, case-sensitive topic segment strings. An event matches when its
+  `topic` array starts with **any** configured prefix (OR across prefixes).
+  When combined with `contractAddresses`, an event must match both (AND).
+- **Backward compatibility**: Omitting `topicPrefixes` or passing `[]` keeps
+  pass-all behavior.
+- **RPC pushdown + SDK guard**: Unless `rpcFilter.topics` is explicitly set,
+  each prefix is sent to Soroban RPC as `[...prefix, '**']`, and re-checked at
+  the SDK level before dispatching to `onRaw` or typed handlers. Filtered
+  events are logged with `reason: "topic_filtered"` and still allow the ledger
+  cursor to advance normally.
+- **Validation**: Passing an empty prefix (`[[]]`) or a blank/non-string
+  segment throws an `Error` at listener construction time.
+
 ## No gaps while catching up
 
 After a long outage the RPC can have far more events than one page
@@ -424,6 +452,39 @@ Recovery may replay part of the last ledger, but it never skips an event.
 Because the RPC cannot expose a stable machine-readable code for this
 condition, detection is message-based and requires both a cursor mention and
 an expiration-like word.
+
+## Explicit error and recovery state transitions
+
+`ContractEventListener` tracks an explicit operational state machine so
+operators, health checks, and alerting hooks can distinguish healthy polling,
+active failures, recovery attempts, and intentional shutdown:
+
+- `idle` — constructed and not yet started (manual `poll()` calls may still run).
+- `running` — actively polling and healthy.
+- `error` — the most recent poll, checkpoint restore, or checkpoint persist failed.
+- `recovering` — attempting a subsequent poll after entering `error`.
+- `stopped` — explicitly stopped via `stop()`.
+
+Subscribe to transitions with `onStateChange` (and unsubscribe with
+`offStateChange`), or inspect `listener.state`, `listener.consecutiveErrors`,
+`listener.lastError`, and `listener.lastTransition`:
+
+```ts
+listener.onStateChange((transition) => {
+  console.log(
+    `[listener] ${transition.from} -> ${transition.to} (${transition.reason})` +
+      ` at ledger ${transition.ledger} (consecutiveErrors=${transition.consecutiveErrors})`,
+  );
+});
+```
+
+Typical failure and recovery sequence:
+
+1. `idle -> running` (`started`) when `start()` is called.
+2. `running -> error` (`poll_error`, `cursor_expired`, `restore_error`, or `persist_error`) on failure.
+3. `error -> recovering` (`recovery_attempt`) when the next poll begins.
+4. `recovering -> running` (`recovered`) once a poll completes and persists cleanly (resetting `consecutiveErrors` to `0` and `lastError` to `null`), or `recovering -> error` if the recovery attempt also fails.
+5. `running | error | recovering -> stopped` (`stopped`) when `stop()` is called; in-flight polls that finish after `stop()` do not overwrite the `stopped` state.
 
 ## The RPC lag monitor
 
@@ -506,6 +567,41 @@ Full backlog drained         : true
 
 ✅ Recovery succeeded — the keeper resumed exactly where it left off.
 ```
+
+## On-chain inventory view for active strategy registrations
+
+The keeper and governance operations surfaces expose a read-only inventory of
+active strategy registrations, so operators can see which strategies the
+engine is currently allowed to route capital to without scanning raw events.
+
+- **Normal behaviour.** The inventory is built by replaying strategy
+  registration and deregistration events in ledger order and keeping only the
+  strategies that are still active at the head ledger. Results are returned
+  sorted by strategy identifier so repeated reads are stable.
+- **Boundary behaviour.** A strategy registered and deregistered within the
+  same ledger does not appear. A re-registration after deregistration appears
+  once, with the newest registration ledger. An empty registry yields an empty
+  inventory rather than an error.
+- **Failure behaviour.** If the event history cannot be read, the view reports
+  the failure as an error and never returns a partial inventory. A cursor that
+  has expired is surfaced through the same typed `cursor_expired` path used by
+  the event listener, and the caller is expected to resume the read from the
+  reported ledger.
+- **Compatibility.** The view is additive; existing listener and rebalancer
+  integrations are unchanged.
+- **Configuration.** No new configuration is required. Operators can
+  checkpoint the inventory cursor with the same `FileCheckpointStore` used by
+  the other keeper components, using a dedicated file such as
+  `state/inventory.json`.
+- **Verification.** Coverage for the normal, boundary, and failure cases lives
+  alongside the recovery tests. Run `npm test` to execute the inventory checks
+  together with the rest of the SDK suite.
+- **Build note.** The duplicate function implementations reported by the
+  TypeScript check in `sdk/src/governance.ts` (TS2393 at lines 933 and 962) must
+  be resolved by keeping a single declaration of each identifier and deleting
+  the duplicate; the file itself should not be rewritten. The unterminated
+  comment reported in `sdk/src/types.ts` (TS1010 at line 461) must likewise be
+  closed with `*/` before the inventory view is considered compiled.
 
 ## Operational notes
 

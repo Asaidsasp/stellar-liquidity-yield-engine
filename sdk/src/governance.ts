@@ -5,6 +5,7 @@
  * Handles proposal creation, voting, fee claiming, and token delegation.
  */
 
+import { simulationReturnValue } from './utils/soroban';
 import { 
   Keypair, 
   SorobanRpc, 
@@ -56,6 +57,30 @@ export const DEFAULT_GOVERNANCE_CONTRACTS: GovernanceContracts = {
   staking: process.env.STAKING_CONTRACT || UNCONFIGURED_CONTRACT,
   feeDistributor: process.env.FEE_DISTRIBUTOR_CONTRACT || UNCONFIGURED_CONTRACT,
 };
+
+/**
+ * A single proposal lifecycle event, as surfaced by the audit view.
+ * `timestamp` is the ledger close time (unix seconds) when known.
+ */
+export interface ProposalLifecycleEvent {
+  proposalId: number;
+  type: 'created' | 'vote' | 'state_changed' | 'queued' | 'executed' | 'canceled';
+  actor?: string;
+  state?: ProposalState;
+  ledger?: number;
+  timestamp?: number;
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Read-only audit view of a proposal's lifecycle events, ordered oldest first.
+ */
+export interface ProposalAuditView {
+  proposalId: number;
+  events: ProposalLifecycleEvent[];
+  /** True when the requested range was truncated by `limit`. */
+  truncated: boolean;
+}
 
 /** True when `contractId` is a usable, explicitly configured contract ID. */
 export function isContractConfigured(contractId: string | undefined | null): boolean {
@@ -162,6 +187,157 @@ export function paginateProposals(
     totalPages,
     hasNext: currentPage < totalPages,
     hasPrevious: currentPage > 1,
+  };
+}
+
+/**
+ * One account's governance participation across a proposal history.
+ *
+ * `eligibleProposals` counts the proposals whose voting window has opened
+ * (anything other than `Pending`), because a pending proposal cannot have been
+ * voted on yet. `participationRate` is `proposalsVoted / eligibleProposals` as
+ * a percentage with one decimal, and is 0 when there is nothing eligible.
+ */
+export interface GovernanceParticipationSummary {
+  account: string;
+  /** Proposals examined. */
+  totalProposals: number;
+  /** Proposals that reached a voting window. */
+  eligibleProposals: number;
+  /** Distinct proposals this account voted on, for or against. */
+  proposalsVoted: number;
+  /** Proposals this account cast a for-vote on. */
+  votesFor: number;
+  /** Proposals this account cast an against-vote on. */
+  votesAgainst: number;
+  /** Sum of the voting power committed across every vote. */
+  votingPowerUsed: bigint;
+  /** Participation percentage (0-100) over `eligibleProposals`. */
+  participationRate: number;
+  /** Proposals this account authored. */
+  proposalsCreated: number;
+  /** IDs of the proposals this account voted on, ascending by history order. */
+  votedProposalIds: number[];
+}
+
+/**
+ * `scValToNative` surfaces voter maps as either a JS `Map` or a plain object
+ * depending on the SDK version, so both shapes are accepted here.
+ */
+type VoterWeights = Record<string, bigint> | Map<string, bigint> | null | undefined;
+
+/**
+ * Normalize a raw voter weight. Values that do not look like an integer
+ * amount are treated as a zero-weight vote rather than throwing, because a
+ * single malformed entry must not take down a whole participation report.
+ */
+function toVotingWeight(raw: unknown): bigint {
+  if (typeof raw === 'bigint') {
+    return raw;
+  }
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return BigInt(Math.trunc(raw));
+  }
+  if (typeof raw === 'string' && /^-?\d+$/.test(raw.trim())) {
+    return BigInt(raw.trim());
+  }
+  return 0n;
+}
+
+/**
+ * Read one account's weight out of a proposal's voter map. Returns `undefined`
+ * when the account is absent, which is what distinguishes "did not vote" from
+ * "voted with zero weight".
+ */
+function readVoterWeight(voters: VoterWeights, account: string): bigint | undefined {
+  if (voters === null || voters === undefined) {
+    return undefined;
+  }
+  if (voters instanceof Map) {
+    return voters.has(account) ? toVotingWeight(voters.get(account)) : undefined;
+  }
+  if (typeof voters === 'object') {
+    const record = voters as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(record, account)) {
+      return undefined;
+    }
+    return toVotingWeight(record[account]);
+  }
+  return undefined;
+}
+
+/**
+ * Summarize one account's participation over a proposal history.
+ *
+ * This is pure so callers can reuse a proposal list they already hold (the UI
+ * does) without another RPC sweep. An account that appears in both voter maps
+ * of a proposal - which a re-vote can produce - is counted once toward
+ * `proposalsVoted` but its weight is counted on both sides.
+ *
+ * @throws TypeError when `account` is empty or `proposals` is not an array.
+ */
+export function summarizeGovernanceParticipation(
+  account: string,
+  proposals: readonly GovernanceProposal[]
+): GovernanceParticipationSummary {
+  if (typeof account !== 'string' || account.trim().length === 0) {
+    throw new TypeError(
+      'Governance participation summary requires a non-empty account address'
+    );
+  }
+  if (!Array.isArray(proposals)) {
+    throw new TypeError('Governance participation summary requires an array of proposals');
+  }
+
+  const address = account.trim();
+  let eligibleProposals = 0;
+  let proposalsVoted = 0;
+  let votesFor = 0;
+  let votesAgainst = 0;
+  let proposalsCreated = 0;
+  let votingPowerUsed = 0n;
+  const votedProposalIds: number[] = [];
+
+  for (const proposal of proposals) {
+    if (proposal.state !== ProposalState.Pending) {
+      eligibleProposals += 1;
+    }
+    if (proposal.proposer === address) {
+      proposalsCreated += 1;
+    }
+
+    const forWeight = readVoterWeight(proposal.forVoters, address);
+    const againstWeight = readVoterWeight(proposal.againstVoters, address);
+    if (forWeight === undefined && againstWeight === undefined) {
+      continue;
+    }
+
+    proposalsVoted += 1;
+    votedProposalIds.push(proposal.id);
+    if (forWeight !== undefined) {
+      votesFor += 1;
+      votingPowerUsed += forWeight;
+    }
+    if (againstWeight !== undefined) {
+      votesAgainst += 1;
+      votingPowerUsed += againstWeight;
+    }
+  }
+
+  return {
+    account: address,
+    totalProposals: proposals.length,
+    eligibleProposals,
+    proposalsVoted,
+    votesFor,
+    votesAgainst,
+    votingPowerUsed,
+    participationRate:
+      eligibleProposals === 0
+        ? 0
+        : Math.round((proposalsVoted / eligibleProposals) * 1000) / 10,
+    proposalsCreated,
+    votedProposalIds,
   };
 }
 
@@ -339,6 +515,46 @@ export class GovernanceSDK {
       );
     }
     return contractId;
+  }
+
+  /**
+   * Build a read-only audit view of proposal lifecycle events.
+   *
+   * Events are read from the governance contract's `get_proposal_events`
+   * entrypoint. Boundary behavior: an unknown proposal ID yields an empty
+   * event list rather than an error; a non-positive or non-integer ID is
+   * rejected; `limit` is clamped to [1, 500] and `truncated` reports when more
+   * events existed. Failure behavior: RPC/simulation errors are propagated.
+   */
+  async getProposalAuditView(
+    proposalId: number,
+    options: { limit?: number; fromLedger?: number } = {}
+  ): Promise<ProposalAuditView> {
+    if (!Number.isInteger(proposalId) || proposalId <= 0) {
+      throw new Error('proposalId must be a positive integer');
+    }
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
+    const fromLedger = options.fromLedger ?? 0;
+
+    const raw = await this.simulateCall(
+      this.governanceContract,
+      'get_proposal_events',
+      { proposal_id: proposalId, from_ledger: fromLedger, limit: limit + 1 }
+    );
+
+    const list: any[] = Array.isArray(raw) ? raw : [];
+    const truncated = list.length > limit;
+    const events: ProposalLifecycleEvent[] = list.slice(0, limit).map((e: any) => ({
+      proposalId,
+      type: e.type,
+      actor: e.actor,
+      state: e.state,
+      ledger: e.ledger !== undefined ? Number(e.ledger) : undefined,
+      timestamp: e.timestamp !== undefined ? Number(e.timestamp) : undefined,
+      details: e.details,
+    }));
+
+    return { proposalId, events, truncated };
   }
 
   /**
@@ -1112,6 +1328,37 @@ export class GovernanceSDK {
   }
 
   /**
+   * Summarize one account's governance participation.
+   *
+   * Pass `options.proposals` to reuse a history the caller already fetched
+   * (the UI does, to avoid a second RPC sweep); otherwise the history is read
+   * through {@link getAllProposals}, bounded by `options.maxProposals`.
+   * Invalid input fails before any RPC request.
+   */
+  async getParticipationSummary(
+    account: string,
+    options: { proposals?: GovernanceProposal[]; maxProposals?: number } = {}
+  ): Promise<GovernanceParticipationSummary> {
+    if (typeof account !== 'string' || account.trim().length === 0) {
+      throw new TypeError(
+        'Governance participation summary requires a non-empty account address'
+      );
+    }
+
+    if (options.proposals !== undefined) {
+      return summarizeGovernanceParticipation(account, options.proposals);
+    }
+
+    const maxProposals = options.maxProposals ?? 1000;
+    if (!Number.isSafeInteger(maxProposals) || maxProposals < 1) {
+      throw new RangeError('maxProposals must be a positive integer');
+    }
+
+    const proposals = await this.getAllProposals(maxProposals);
+    return summarizeGovernanceParticipation(account, proposals);
+  }
+
+  /**
    * Get proposals by state
    */
   async getProposalsByState(state: ProposalState): Promise<GovernanceProposal[]> {
@@ -1233,12 +1480,8 @@ export class GovernanceSDK {
         .build()
     );
 
-    if (
-      simResult.result &&
-      (simResult.result as any).status === 'SUCCESS' &&
-      (simResult.result as any).returnValue
-    ) {
-      return scValToNative((simResult.result as any).returnValue);
+    if (!SorobanRpc.Api.isSimulationError(simResult)) {
+      return scValToNative(simulationReturnValue(simResult));
     }
     return null;
   }

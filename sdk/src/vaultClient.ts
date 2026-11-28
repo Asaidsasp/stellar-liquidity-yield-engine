@@ -7,6 +7,7 @@ import {
   TransactionBuilder,
   Networks,
   BASE_FEE,
+  SorobanRpc,
   xdr,
   scValToNative
 } from 'stellar-sdk';
@@ -21,6 +22,7 @@ import {
   TransactionResult,
   VaultError,
   NetworkConfig,
+  VaultClientConfig,
   VaultClientOptions,
   PauseReason,
   VaultEvent
@@ -30,12 +32,12 @@ import { checkRpcHealth, waitForTransaction } from './utils/transaction';
 export class VaultClient extends EventEmitter {
   private contract: Contract;
   private server: SorobanRpc.Server;
-  private networkConfig: NetworkConfig;
+  private networkConfig: VaultClientConfig;
   private simulationSource?: string;
 
   constructor(
     vaultAddress: Address,
-    networkConfig: NetworkConfig,
+    networkConfig: VaultClientConfig,
     options: VaultClientOptions = {}
   ) {
     super();
@@ -92,7 +94,7 @@ export class VaultClient extends EventEmitter {
         gasUsed: 0,
         error: txResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED ? txResult.status : undefined
       };
-    } catch (error) {
+    } catch (error: any) {
       throw new VaultError(`Deposit failed: ${error.message}`, 'DEPOSIT_ERROR');
     }
   }
@@ -164,7 +166,7 @@ export class VaultClient extends EventEmitter {
         amountA: 0n,
         amountB: 0n
       };
-    } catch (error) {
+    } catch (error: any) {
       throw new VaultError(`Withdraw failed: ${error.message}`, 'WITHDRAW_ERROR');
     }
   }
@@ -184,7 +186,7 @@ export class VaultClient extends EventEmitter {
         fee: options?.gasLimit ? `${options.gasLimit}` : BASE_FEE,
         networkPassphrase: this.getNetworkPassphrase()
       })
-        .addOperation(this.contract.call('harvest', userAddress))
+        .addOperation(this.contract.call('harvest', addressArg(userAddress)))
         .setTimeout(options?.timeout || 30)
         .build();
 
@@ -210,7 +212,7 @@ export class VaultClient extends EventEmitter {
         gasUsed: 0,
         error: txResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED ? txResult.status : undefined
       };
-    } catch (error) {
+    } catch (error: any) {
       throw new VaultError(`Harvest failed: ${error.message}`, 'HARVEST_ERROR');
     }
   }
@@ -232,12 +234,12 @@ export class VaultClient extends EventEmitter {
           .build()
       );
 
-      if (result.result?.status !== 'SUCCESS') {
+      if (SorobanRpc.Api.isSimulationError(result)) {
         throw new Error('Failed to get vault info');
       }
 
-      return this.parseVaultInfo(result.result.returnValue);
-    } catch (error) {
+      return this.parseVaultInfo(simulationReturnValue(result));
+    } catch (error: any) {
       throw new VaultError(`Failed to get vault info: ${error.message}`, 'GET_INFO_ERROR');
     }
   }
@@ -259,12 +261,12 @@ export class VaultClient extends EventEmitter {
           .build()
       );
 
-      if (result.result?.status !== 'SUCCESS') {
+      if (SorobanRpc.Api.isSimulationError(result)) {
         throw new Error('Failed to get metrics');
       }
 
-      return this.parseMetrics(result.result.returnValue);
-    } catch (error) {
+      return this.parseMetrics(simulationReturnValue(result));
+    } catch (error: any) {
       throw new VaultError(`Failed to get metrics: ${error.message}`, 'GET_METRICS_ERROR');
     }
   }
@@ -282,16 +284,16 @@ export class VaultClient extends EventEmitter {
             networkPassphrase: this.getNetworkPassphrase()
           }
         )
-          .addOperation(this.contract.call('get_user_position', userAddress))
+          .addOperation(this.contract.call('get_user_position', addressArg(userAddress)))
           .build()
       );
 
-      if (result.result?.status !== 'SUCCESS') {
+      if (SorobanRpc.Api.isSimulationError(result)) {
         throw new Error('Failed to get user position');
       }
 
-      return this.parseUserPosition(result.result.returnValue);
-    } catch (error) {
+      return this.parseUserPosition(simulationReturnValue(result));
+    } catch (error: any) {
       throw new VaultError(`Failed to get user position: ${error.message}`, 'GET_POSITION_ERROR');
     }
   }
@@ -313,12 +315,12 @@ export class VaultClient extends EventEmitter {
           .build()
       );
 
-      if (result.result?.status !== 'SUCCESS') {
+      if (SorobanRpc.Api.isSimulationError(result)) {
         throw new Error('Failed to get APY');
       }
 
-      return Number(scValToNative(result.result.returnValue));
-    } catch (error) {
+      return Number(scValToNative(simulationReturnValue(result)));
+    } catch (error: any) {
       throw new VaultError(`Failed to get APY: ${error.message}`, 'GET_APY_ERROR');
     }
   }
@@ -340,12 +342,12 @@ export class VaultClient extends EventEmitter {
           .build()
       );
 
-      if (result.result?.status !== 'SUCCESS') {
+      if (SorobanRpc.Api.isSimulationError(result)) {
         throw new Error('Failed to get TVL');
       }
 
-      return BigInt(scValToNative(result.result.returnValue));
-    } catch (error) {
+      return BigInt(scValToNative(simulationReturnValue(result)));
+    } catch (error: any) {
       throw new VaultError(`Failed to get TVL: ${error.message}`, 'GET_TVL_ERROR');
     }
   }
@@ -367,12 +369,12 @@ export class VaultClient extends EventEmitter {
           .build()
       );
 
-      if (result.result?.status !== 'SUCCESS') {
+      if (SorobanRpc.Api.isSimulationError(result)) {
         throw new Error('Failed to check pause status');
       }
 
-      return Boolean(scValToNative(result.result.returnValue));
-    } catch (error) {
+      return Boolean(scValToNative(simulationReturnValue(result)));
+    } catch (error: any) {
       throw new VaultError(`Failed to check pause status: ${error.message}`, 'PAUSE_CHECK_ERROR');
     }
   }
@@ -636,6 +638,12 @@ export class VaultClient extends EventEmitter {
    * what wires browser-wallet signing (e.g. Freighter) into every write
    * method.
    */
+  private async confirmTransaction(
+    hash: string,
+  ): Promise<SorobanRpc.Api.GetTransactionResponse> {
+    return waitForTransaction(this.server, hash);
+  }
+
   private async signWith(signerOrKeypair: any, tx: Transaction): Promise<Transaction> {
     if (typeof signerOrKeypair.signTransaction === 'function') {
       return await signerOrKeypair.signTransaction(tx, this.getNetworkPassphrase());

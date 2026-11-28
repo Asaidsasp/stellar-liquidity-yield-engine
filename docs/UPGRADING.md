@@ -20,12 +20,20 @@ All seven contracts (`StellarLiquidityYieldEngine`, `YieldVault`,
 | --- | --- | --- |
 | `upgrade(admin, new_wasm_hash)` | stored admin | Replace the contract's code. Takes effect on the **next** invocation. |
 | `migrate(admin)` | stored admin | Adopt this build's storage schema version. Returns the version it replaced. Idempotent. |
+| `is_initialized()` | none | Safely return whether initialization has recorded an admin. Returns `false` before initialization. |
 | `get_storage_version()` | none | The schema version recorded in the contract's storage. |
 
 `upgrade` publishes a `contract_upgraded` event carrying `(admin, wasm_hash)`;
 `migrate` publishes `contract_migrated` with `(admin, from, to)`. An off-chain
 monitor should watch `contract_upgraded` — it is the only signal that the code
 behind an address changed without the address changing.
+
+`is_initialized()` does not require authorization and does not panic when the
+contract has not been initialized. It checks for the admin key written by each
+initializer, so existing initialized deployments remain detectable even if
+they predate storage-version tracking. Calls against an invalid or unavailable
+contract address still fail at the RPC/host layer; the query only makes the
+uninitialized state explicit for a deployed contract.
 
 `initialize` records `upgrade::STORAGE_VERSION` (`src/upgrade.rs`), so a freshly
 deployed contract starts at the version of the code that deployed it. A
@@ -146,6 +154,18 @@ check_rollback_ready || { echo "Rollback readiness check failed; do not upgrade"
 After a rollback, verify the `contract_upgraded` event carries `OLD_WASM_HASH`
 and that `get_storage_version()` still matches the value recorded above.
 
+### Validating the stages first
+
+A production promotion goes through seven gates: preflight, install, simulate,
+staging on a separate contract, promote, verify and closeout. Build the plan
+from the evidence gathered so far with
+`planStagedUpgrade()` (`sdk/src/stagedUpgrade.ts`) and refuse to submit
+`upgrade` until `plan.canPromote` is true and `plan.nextStage === 'promote'`.
+It blocks a promotion with a missing rollback hash, a schema downgrade, a
+migration whose version does not move, an unverified staging copy, or too few
+approvals — the full procedure is
+[docs/STAGED_UPGRADE_VALIDATION.md](STAGED_UPGRADE_VALIDATION.md).
+
 ### Rolling back
 
 Point `upgrade` at `OLD_WASM_HASH` from the readiness check. The rollback is
@@ -232,11 +252,51 @@ contract's features.
   code's version, so a post-mortem can tell which build ran against which
   storage.
 
+A configuration change that also alters a stored shape is a migration: follow
+[docs/CONFIG_MIGRATION_CHECKLIST.md](CONFIG_MIGRATION_CHECKLIST.md) for the
+scope classification, bounds, snapshot/rollback and keeper-restart checklists,
+and bump `STORAGE_VERSION` here in the same change.
+
 An example of a change that needs both a bump and migration work: adding
 `RewardStream::claim_deadline` ([#121](https://github.com/Kevin737866/stellar-liquidity-yield-engine/issues/121))
 changes the encoding of the stored stream list, so a build containing it must
 migrate the stored `streams` vector rather than decode it as-is.
 
+## If an upgrade fails
+
+Recovery is a triage problem before it is a transaction problem: a failed
+`upgrade` invocation reverts atomically, so the first question is whether the
+code changed at all and whether the recorded schema version matches it.
+[docs/RUNBOOK_FAILED_UPGRADE.md](RUNBOOK_FAILED_UPGRADE.md) is the operator
+procedure — freeze and capture, triage, retry / roll back / finish forward /
+re-deploy / escalate, verification, keeper resume, close-out — and lists the
+boundary and failure cases (unknown wasm hash, non-admin rejection, schema
+version ahead of the build, partial migration, lost admin key).
+
+The same triage is encoded in the SDK, so an on-call script can print the plan
+and its blockers instead of reconstructing them by hand:
+
+```ts
+import {
+  formatUpgradeRecoveryPlan,
+  planUpgradeRecovery,
+} from 'stellar-liquidity-yield-engine-sdk';
+
+const plan = planUpgradeRecovery({
+  phase: 'post_upgrade_verification',
+  liveCode: 'new', // what answers at the address now
+  expectedStorageVersion: 2,
+  storageVersion: 1, // from get_storage_version
+  previousWasmHash: PREVIOUS_WASM_HASH,
+  paused: true,
+});
+
+console.log(formatUpgradeRecoveryPlan(plan));
+```
+
+`plan.safeToRetry` is true only when the failed attempt provably changed
+nothing; `plan.blockers` lists what must be resolved before the plan can run.
+Covered by `sdk/src/upgradeRecovery.test.ts`.
 ## Safe role rotation
 
 Admin and keeper roles are the only keys that can change code (`upgrade`),
@@ -287,11 +347,19 @@ a no-op, and a failed rotation leaves the existing admin in place. Run
 
 ## Testing an upgrade
 
-- `tests/upgrade_tests.rs` covers all seven contracts: version recorded at
-  `initialize`, `migrate` reporting and idempotency, non-admin rejection of both
+- `tests/upgrade_tests.rs` covers all seven contracts: initialization status
+  before and after `initialize`, version recorded at `initialize`, `migrate`
+  reporting and idempotency, non-admin rejection of both
   admin entrypoints, rejection of an unknown wasm hash, and a real code swap
   through the host deployer (the contract's entrypoints stop existing, while the
   address and storage survive).
+- A stored-layout change is also tested against captured state: run a
+  `get_storage_version` fixture through the build's migration ladder with
+  `checkMigrationCompatibility()` / `assertMigrationCompatible()`
+  (`npx jest sdk/src/storageMigrationCompat.test.ts`). It blocks the upgrade on
+  ladder gaps, downgrades, dropped keys and non-idempotent migration work before
+  any wasm is installed — see
+  [docs/STORAGE_MIGRATION_COMPATIBILITY.md](STORAGE_MIGRATION_COMPATIBILITY.md).
 - The same file also covers rollback readiness (an uninstalled rollback hash is
   rejected) and persistent-storage expiration boundaries: an entry is readable
   on its last live ledger, archived on the next one, and `extend_ttl` moves that
@@ -307,3 +375,89 @@ a no-op, and a failed rotation leaves the existing admin in place. Run
   unknown wasm hashes) are each covered explicitly.
 - The test builds the "replacement" wasm bytes in-process
   (`empty_contract_wasm`), so it needs no build artefact and runs in CI.
+
+## Staged validation tool
+
+`sdk/src/upgradeValidator.ts` runs the pre-upgrade gate as ordered stages and
+stops at the first failure. It is pure: read the facts from the network, pass
+them in, act on the report.
+
+| Stage | Passes when |
+| --- | --- |
+| `inputs` | both wasm hashes are 64-character hex and differ |
+| `admin` | the signing key equals the contract's stored admin |
+| `version` | `get_storage_version()` is readable and not newer than the target build |
+| `migration` | no migration is needed, it is reversible, or `acceptIrreversible` is set |
+| `rollback` | both the previous and the new wasm hashes are installed on the network |
+
+```ts
+import { validateUpgrade, formatUpgradeReport } from './sdk/src/upgradeValidator';
+
+const report = validateUpgrade({
+  oldWasmHash, newWasmHash,
+  signerAddress, storedAdmin,
+  currentStorageVersion, targetStorageVersion: 1,
+  migrationReversible: true,
+  installedWasmHashes,
+});
+console.log(formatUpgradeReport(report));
+if (!report.ok) process.exit(1);
+```
+
+Run `npx jest sdk/src/upgradeValidator` for its tests.
+
+## Runbook: recovering from a failed upgrade
+
+Work top to bottom and stop as soon as the contract is healthy. Every step is
+admin-only and takes effect on the next invocation.
+
+1. **Freeze.** Pause the contract (`pause`) so no user transaction runs against
+   half-migrated state. Governance: queue the pause through the timelock only if
+   the emergency signers cannot act.
+2. **Diagnose which step failed.**
+   - `upgrade` reverted: the live code is unchanged. Check the wasm hash is
+     installed (`rollback` stage above) and the signer is the admin, fix it, retry.
+   - `upgrade` succeeded but calls fail: the new code is live. Read
+     `get_storage_version()`; if it is missing the contract has no matching
+     entrypoints (wrong wasm) and you must roll back.
+   - `migrate` failed or was never run: the code is new and the version is old.
+     `migrate` is idempotent, so fix the cause and call it again.
+3. **Decide rollback or forward fix.**
+   - Migration reversible (`MIGRATION_REVERSIBLE=true`): call `upgrade` with
+     `OLD_WASM_HASH` recorded before the swap.
+   - Migration not reversible: do not roll back in place. Ship a forward-fix wasm,
+     or use Flow B (re-deploy and migrate).
+4. **Verify.** `get_storage_version()` matches the code now live, read-only
+   getters return the values you recorded before the upgrade, and the
+   `contract_upgraded` / `contract_migrated` events show the expected hash and
+   versions.
+5. **Resume.** Unpause, then watch keepers and events for one full cycle. Keepers
+   restore their checkpoint on start (see `docs/KEEPER_RECOVERY.md`).
+6. **Record.** Write the failed hash, the cause, the rollback hash and the
+   transaction ids in the release notes.
+
+## Checklist: protocol configuration changes
+
+Use this for any change to fees, timelock delay, thresholds, strategy
+parameters or emergency signers. Copy it into the change ticket.
+
+- [ ] Current values read and recorded (vault `get_timelock_delay`,
+      `get_emergency_threshold`, `get_emergency_signers`, registry
+      `get_strategy_parameters`).
+- [ ] New values stay inside documented bounds; a boundary case (min and max) was
+      tried on testnet.
+- [ ] Change goes through the timelock or governance proposal, not a direct admin
+      call, unless it is an emergency.
+- [ ] Storage-shape change? Then `STORAGE_VERSION` is bumped and `migrate` is
+      extended; run the staged validation tool first.
+- [ ] Keepers and the SDK accept the new values (no hard-coded copies).
+- [ ] Rollback values are written down and a rollback transaction is prepared.
+- [ ] After execution: getters return the new values and the change event was seen.
+- [ ] Docs and the SDK defaults updated in the same change.
+
+## Storage migration compatibility tests
+
+`tests/upgrade_tests.rs` also checks that migrating from an unversioned
+(pre-tracking) state keeps existing data, that a failed (unauthorized) `migrate`
+leaves the recorded version alone, and that all seven contracts adopt the current
+version from an unversioned state and stay idempotent afterwards.

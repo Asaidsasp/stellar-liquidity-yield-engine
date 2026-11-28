@@ -72,12 +72,26 @@ npm install
 npm run build
 ```
 
+### SDK releases
+
+The SDK uses Semantic Versioning and has a documented release, prerelease,
+backward-compatibility, rollback, and publishing policy. See
+[docs/SDK_RELEASE_AND_SEMVER.md](docs/SDK_RELEASE_AND_SEMVER.md) before
+changing the package version.
+
 ### Setup UI
 ```bash
 cd ui/
 npm install
+npm run build
 npm run dev
 ```
+
+Before starting or building the dashboard, copy `ui/.env.example` to
+`ui/.env.local` and set only the values needed for the target deployment.
+The dashboard's complete variable reference, precedence rules, public-value
+constraints, and missing-contract behavior are documented in
+[Dashboard environment variables](docs/DASHBOARD_ENVIRONMENT.md).
 
 ## 🔧 Quick Start
 
@@ -367,6 +381,18 @@ import { ImpermanentLossChart } from '@/components/ImpermanentLossChart';
 - **In-place Upgrades**: Every contract exposes admin-only `upgrade(admin, new_wasm_hash)`,
   `migrate(admin)` and `get_storage_version()` so deployed state can be fixed
   without changing the contract address — see [docs/UPGRADING.md](docs/UPGRADING.md)
+- **Failed-Upgrade Recovery**: A triage runbook for an upgrade that did not
+  land, landed on the wrong schema, or needs a rollback — see
+  [docs/RUNBOOK_FAILED_UPGRADE.md](docs/RUNBOOK_FAILED_UPGRADE.md) and
+  `planUpgradeRecovery()` in the SDK
+- **Storage-Migration Compatibility**: `checkMigrationCompatibility()` runs a
+  captured storage fixture through a migration ladder and blocks the upgrade on
+  gaps, dropped keys, downgrades and non-idempotent work before the wasm ships —
+  see [docs/STORAGE_MIGRATION_COMPATIBILITY.md](docs/STORAGE_MIGRATION_COMPATIBILITY.md)
+- **Staged Upgrade Validation**: `planStagedUpgrade()` gates a promotion on
+  installed wasm, simulation, a verified staging copy, approvals and a written
+  rollback plan, and refuses to advance until each stage is complete — see
+  [docs/STAGED_UPGRADE_VALIDATION.md](docs/STAGED_UPGRADE_VALIDATION.md)
 - **Emergency Pause**: Admin can pause all operations
 - **Access Control**: Role-based permissions
 - **Input Validation**: Comprehensive parameter checks
@@ -404,6 +430,8 @@ Real-time monitoring of:
 - Risk metrics and alerts
 - Gas usage and optimization
 - User activity patterns
+
+The `/transactions` history includes expandable [transaction confirmation details](docs/TRANSACTION_CONFIRMATION_DETAILS.md) showing the vault and pool selected for each transaction.
 
 ## 🌐 Network Support
 
@@ -466,7 +494,9 @@ CHECK_INTERVAL=300000
 `sdk/src/governance.ts`. There is no working contract to deploy for those
 yet — see [GOVERNANCE_STATUS.md](GOVERNANCE_STATUS.md). The SDK history reader
 does support bounded pages via `getProposalPage()` / `paginateProposals()` for
-keepers and UI callers.
+keepers and UI callers, plus a per-account reporting surface through
+`getParticipationSummary()` / `summarizeGovernanceParticipation()` (proposals
+voted, for/against split, voting power used and participation rate).
 
 ### Optional Network Configuration Behavior
 
@@ -500,6 +530,37 @@ objects):
     `NetworkConfigError` (`MISSING_CONTRACT_ID`) naming the missing variable,
     and constructing `RebalancerClient` without a `rebalanceEngine` contract ID
     throws `RebalanceError` (`MISSING_CONTRACT_ID`).
+
+Protocol parameter changes (fees, rebalance threshold, insurance reserve)
+follow [docs/CONFIG_MIGRATION_CHECKLIST.md](docs/CONFIG_MIGRATION_CHECKLIST.md)
+and `buildConfigMigrationChecklist()` in the SDK. A change that alters a stored
+shape also needs the version bump and migration described in
+[docs/UPGRADING.md](docs/UPGRADING.md).
+
+### Dashboard environment variables
+
+For the Next.js dashboard, use `ui/.env.example` as the source of truth.
+Dashboard variables use the `NEXT_PUBLIC_` prefix because Next.js exposes
+their values to browser code. Copy it to `ui/.env.local` for local
+development; deployment platforms should set the variables in their
+environment. Values are inlined at build time, so rebuild/redeploy after a
+change.
+
+Precedence, from highest to lowest, is:
+
+1. existing shell or deployment-platform environment
+2. `ui/.env.local`
+3. `ui/.env.development.local` or `ui/.env.production.local`
+4. `ui/.env.development` or `ui/.env.production`
+5. `ui/.env`
+6. built-in public testnet defaults, or an empty contract ID
+
+An invalid or unknown `NEXT_PUBLIC_STELLAR_NETWORK` value defaults to
+`testnet`. Blank or unset endpoint variables use the public endpoint for the
+selected network, while blank or unset contract IDs remain empty and produce
+an actionable unconfigured-contract error. Never put private keys or seed
+phrases in dashboard variables. Full details and the variable table are in
+[Dashboard environment variables](docs/DASHBOARD_ENVIRONMENT.md).
 
 ### Contract Deployment
 
@@ -595,6 +656,9 @@ npm test
 cd ui/
 npm test
 ```
+
+For TTL renewal across repeated contract writes, see
+[Storage TTL testing](docs/STORAGE_TTL_TESTING.md).
 
 ### Integration Tests
 ```bash

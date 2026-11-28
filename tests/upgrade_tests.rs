@@ -1,9 +1,11 @@
 //! Upgrade-path tests for every contract in the crate (Issue #120).
 //!
-//! Each contract exposes the same three entrypoints:
+//! Each contract exposes the same upgrade and initialization-status entrypoints:
 //!
 //! * `upgrade(admin, new_wasm_hash)` — swaps the contract's code via
 //!   `Env::deployer().update_current_contract_wasm`, keeping address and storage.
+//! * `is_initialized()` — safely reports whether initialization has recorded an
+//!   admin, returning `false` before initialization.
 //! * `get_storage_version()` — the schema version recorded in storage.
 //! * `migrate(admin)` — adopts this build's schema version, returning the one it
 //!   replaced.
@@ -190,6 +192,54 @@ fn test_every_contract_records_its_storage_version_on_initialize() {
 }
 
 #[test]
+fn test_initialization_status_is_safe_before_and_after_initialize() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let engine_id = env.register(StellarLiquidityYieldEngine, ());
+    let engine = StellarLiquidityYieldEngineClient::new(&env, &engine_id);
+    let vault_id = env.register(YieldVault, ());
+    let vault = YieldVaultClient::new(&env, &vault_id);
+    let distributor_id = env.register(MultiRewardDistributor, ());
+    let distributor = MultiRewardDistributorClient::new(&env, &distributor_id);
+    let rebalance_id = env.register(RebalanceEngine, ());
+    let rebalance = RebalanceEngineClient::new(&env, &rebalance_id);
+    let registry_id = env.register(StrategyRegistry, ());
+    let registry = StrategyRegistryClient::new(&env, &registry_id);
+    let insurance_id = env.register(ILInsurance, ());
+    let insurance = ILInsuranceClient::new(&env, &insurance_id);
+    let actuary_id = env.register(Actuary, ());
+    let actuary = ActuaryClient::new(&env, &actuary_id);
+
+    assert!(!engine.is_initialized());
+    assert!(!vault.is_initialized());
+    assert!(!distributor.is_initialized());
+    assert!(!rebalance.is_initialized());
+    assert!(!registry.is_initialized());
+    assert!(!insurance.is_initialized());
+    assert!(!actuary.is_initialized());
+
+    let (engine, ..) = with_engine(&env);
+    let (vault, ..) = with_vault(&env);
+    let (distributor, ..) = with_distributor(&env);
+    let (rebalance, ..) = with_rebalance_engine(&env);
+    let (registry, ..) = with_registry(&env);
+    let (insurance, ..) = with_insurance(&env);
+    let (actuary, ..) = with_actuary(&env);
+
+    assert!(engine.is_initialized());
+    assert!(vault.is_initialized());
+    assert!(distributor.is_initialized());
+    assert!(rebalance.is_initialized());
+    assert!(registry.is_initialized());
+    assert!(insurance.is_initialized());
+    assert!(actuary.is_initialized());
+
+    let missing_contract = StellarLiquidityYieldEngineClient::new(&env, &Address::generate(&env));
+    assert!(missing_contract.try_is_initialized().is_err());
+}
+
+#[test]
 fn test_migrate_reports_replaced_version_and_is_idempotent() {
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();
@@ -199,6 +249,7 @@ fn test_migrate_reports_replaced_version_and_is_idempotent() {
     // stored data exists, the version key does not.
     remove_storage_version(&env, &contract_id);
     assert_eq!(client.get_storage_version(), 0);
+    assert!(client.is_initialized());
 
     assert_eq!(client.migrate(&admin), 0, "returns the version it replaced");
     assert_eq!(client.get_storage_version(), EXPECTED_VERSION);
@@ -229,6 +280,86 @@ fn test_migrate_is_admin_only() {
     assert!(registry.try_migrate(&stranger).is_err());
     assert!(insurance.try_migrate(&stranger).is_err());
     assert!(actuary.try_migrate(&stranger).is_err());
+}
+
+// ==================== Storage migration compatibility ====================
+
+/// Data written before the version key existed must survive `migrate`: only the
+/// version is adopted, existing state is left untouched.
+#[test]
+fn test_migrate_from_unversioned_storage_preserves_existing_state() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, contract_id) = with_engine(&env);
+
+    let registry_before = client.get_strategy_registry();
+    remove_storage_version(&env, &contract_id);
+    assert_eq!(client.get_storage_version(), 0);
+
+    assert_eq!(client.migrate(&admin), 0);
+    assert_eq!(client.get_storage_version(), EXPECTED_VERSION);
+    assert_eq!(client.get_strategy_registry(), registry_before);
+}
+
+/// A migration that fails authorization must not move the version, so a retry
+/// by the real admin still reports the version it replaces.
+#[test]
+fn test_failed_migrate_does_not_change_the_recorded_version() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, contract_id) = with_vault(&env);
+    let stranger = Address::generate(&env);
+
+    remove_storage_version(&env, &contract_id);
+    assert!(client.try_migrate(&stranger).is_err());
+    assert_eq!(client.get_storage_version(), 0);
+
+    assert_eq!(client.migrate(&admin), 0);
+    assert_eq!(client.get_storage_version(), EXPECTED_VERSION);
+}
+
+/// Every contract adopts the current version from an unversioned state and is
+/// idempotent afterwards.
+#[test]
+fn test_every_contract_migrates_from_unversioned_storage() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (engine, engine_admin, engine_id) = with_engine(&env);
+    let (vault, vault_admin, vault_id) = with_vault(&env);
+    let (distributor, distributor_admin, distributor_id) = with_distributor(&env);
+    let (rebalance, rebalance_admin, rebalance_id) = with_rebalance_engine(&env);
+    let (registry, registry_admin, registry_id) = with_registry(&env);
+    let (insurance, insurance_admin, insurance_id) = with_insurance(&env);
+    let (actuary, actuary_admin, actuary_id) = with_actuary(&env);
+
+    for id in [
+        &engine_id,
+        &vault_id,
+        &distributor_id,
+        &rebalance_id,
+        &registry_id,
+        &insurance_id,
+        &actuary_id,
+    ] {
+        remove_storage_version(&env, id);
+    }
+
+    assert_eq!(engine.migrate(&engine_admin), 0);
+    assert_eq!(vault.migrate(&vault_admin), 0);
+    assert_eq!(distributor.migrate(&distributor_admin), 0);
+    assert_eq!(rebalance.migrate(&rebalance_admin), 0);
+    assert_eq!(registry.migrate(&registry_admin), 0);
+    assert_eq!(insurance.migrate(&insurance_admin), 0);
+    assert_eq!(actuary.migrate(&actuary_admin), 0);
+
+    assert_eq!(engine.migrate(&engine_admin), EXPECTED_VERSION);
+    assert_eq!(vault.migrate(&vault_admin), EXPECTED_VERSION);
+    assert_eq!(distributor.migrate(&distributor_admin), EXPECTED_VERSION);
+    assert_eq!(rebalance.migrate(&rebalance_admin), EXPECTED_VERSION);
+    assert_eq!(registry.migrate(&registry_admin), EXPECTED_VERSION);
+    assert_eq!(insurance.migrate(&insurance_admin), EXPECTED_VERSION);
+    assert_eq!(actuary.migrate(&actuary_admin), EXPECTED_VERSION);
 }
 
 // ==================== Upgrade ====================
@@ -392,15 +523,16 @@ fn test_extend_ttl_moves_the_persistent_expiration_boundary() {
         storage.extend_ttl(&key, 100, 200);
     });
 
-    // The old boundary (ledger 64) is now inside the extended lifetime, and the
-    // new last live ledger is 0 + 200 - 1 = 199.
+    // The old boundary (ledger 64) is now inside the extended lifetime. The
+    // host treats the extended live-until ledger as inclusive, so the entry is
+    // readable through ledger 200 and archived from 201 onwards.
     env.ledger().set_sequence_number(64);
     assert_eq!(persistent_probe(&env, &contract_id, &key), Some(11));
 
-    env.ledger().set_sequence_number(199);
+    env.ledger().set_sequence_number(200);
     assert_eq!(persistent_probe(&env, &contract_id, &key), Some(11));
 
-    env.ledger().set_sequence_number(200);
+    env.ledger().set_sequence_number(201);
     assert_persistent_entry_archived(&env, &contract_id, &key);
 }
 
